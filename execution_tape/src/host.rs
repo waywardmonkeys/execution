@@ -19,6 +19,39 @@ use crate::value::Value;
 #[cfg(doc)]
 use crate::program::Program;
 
+/// Sink for recording resource accesses during execution.
+///
+/// This is an optional integration point intended for incremental execution systems (e.g.
+/// `execution_graph`). A sink is provided to host calls via [`Host::call_with_access`].
+pub trait AccessSink {
+    /// Records a read of `key` (a dependency edge).
+    fn read(&mut self, key: ResourceKeyRef<'_>);
+    /// Records a write of `key` (an invalidation source).
+    fn write(&mut self, key: ResourceKeyRef<'_>);
+}
+
+/// A borrowed resource key used to model dependencies for incremental execution.
+///
+/// This type is intentionally small and allocation-free; sinks that need ownership should clone
+/// the referenced strings.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKeyRef<'a> {
+    /// An external input by name (e.g. environment, provided parameter, or named input binding).
+    Input(&'a str),
+    /// Host state consulted by an operation, with a key namespace local to the host op.
+    HostState {
+        /// Host operation identifier.
+        op: SigHash,
+        /// Opaque per-op key identifying the consulted state.
+        key: u64,
+    },
+    /// Conservative dependency for opaque host operations.
+    OpaqueHost {
+        /// Host operation identifier.
+        op: SigHash,
+    },
+}
+
 /// A host-call signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostSig {
@@ -171,6 +204,23 @@ pub trait Host {
         sig_hash: SigHash,
         args: &[ValueRef<'_>],
     ) -> Result<(Vec<Value>, u64), HostError>;
+
+    /// Performs a host call with an optional [`AccessSink`].
+    ///
+    /// Migration note: existing `Host` implementations do not need to change; the default
+    /// implementation forwards to [`Host::call`]. Hosts that want to record incremental
+    /// dependencies should override this method and record reads/writes using `access`.
+    #[inline]
+    fn call_with_access(
+        &mut self,
+        symbol: &str,
+        sig_hash: SigHash,
+        args: &[ValueRef<'_>],
+        access: Option<&mut dyn AccessSink>,
+    ) -> Result<(Vec<Value>, u64), HostError> {
+        let _ = access;
+        self.call(symbol, sig_hash, args)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
