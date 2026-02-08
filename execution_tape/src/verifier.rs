@@ -20,7 +20,9 @@ use crate::format::DecodeError;
 use crate::host::sig_hash_slices;
 use crate::instr_operands;
 use crate::opcode::Opcode;
-use crate::program::{ConstEntry, ElemTypeId, Function, Program, SpanEntry, TypeId, ValueType};
+use crate::program::{
+    ConstEntry, ElemTypeId, Function, Program, SpanEntry, SymbolId, TypeId, ValueType,
+};
 use crate::typed::{
     AggReg, BoolReg, BytesReg, DecimalReg, F64Reg, FuncReg, I64Reg, ObjReg, RegClass, RegCounts,
     RegLayout, StrReg, U64Reg, UnitReg, VReg, VRegSlice, VerifiedDecodedInstr, VerifiedFunction,
@@ -151,6 +153,34 @@ pub enum VerifyError {
     FunctionSigCountMismatch {
         /// Function index within the program.
         func: u32,
+    },
+    /// A function output-name entry references an invalid return index.
+    FunctionOutputNameRetOutOfBounds {
+        /// Function index within the program.
+        func: u32,
+        /// Return index within the function signature.
+        ret: u32,
+    },
+    /// A function output name is empty.
+    FunctionOutputNameEmpty {
+        /// Function index within the program.
+        func: u32,
+        /// Return index within the function signature.
+        ret: u32,
+    },
+    /// A function output name is duplicated within the same function signature.
+    FunctionOutputNameDuplicate {
+        /// Function index within the program.
+        func: u32,
+        /// Symbol id naming the duplicated output.
+        name: SymbolId,
+    },
+    /// A function declares multiple names for the same return index.
+    FunctionOutputNameDuplicateRetIndex {
+        /// Function index within the program.
+        func: u32,
+        /// Return index within the function signature.
+        ret: u32,
     },
     /// A function span table has a bad `pc_delta` sequence.
     ///
@@ -469,6 +499,28 @@ impl fmt::Display for VerifyError {
             Self::FunctionSigCountMismatch { func } => {
                 write!(f, "function {func} signature count mismatch")
             }
+            Self::FunctionOutputNameRetOutOfBounds { func, ret } => {
+                write!(
+                    f,
+                    "function {func} output name ret index out of bounds: {ret}"
+                )
+            }
+            Self::FunctionOutputNameEmpty { func, ret } => {
+                write!(f, "function {func} output name is empty for ret {ret}")
+            }
+            Self::FunctionOutputNameDuplicate { func, name } => {
+                write!(
+                    f,
+                    "function {func} output name is duplicated (symbol_id={})",
+                    name.0
+                )
+            }
+            Self::FunctionOutputNameDuplicateRetIndex { func, ret } => {
+                write!(
+                    f,
+                    "function {func} output name ret index is duplicated: {ret}"
+                )
+            }
             Self::BadSpanDeltas { func } => {
                 write!(f, "function {func} span table has bad pc_deltas")
             }
@@ -684,6 +736,7 @@ impl Default for VerifyConfig {
 /// Verifies `program` according to v1 container-level rules.
 pub fn verify_program(program: &Program, cfg: &VerifyConfig) -> Result<(), VerifyError> {
     verify_host_sigs(program)?;
+    verify_function_output_names(program)?;
 
     for (i, func) in program.functions.iter().enumerate() {
         let func_id = u32::try_from(i).unwrap_or(u32::MAX);
@@ -698,6 +751,7 @@ pub fn verify_program_with_lints(
     cfg: &VerifyConfig,
 ) -> Result<Vec<VerifyLint>, VerifyError> {
     verify_host_sigs(program)?;
+    verify_function_output_names(program)?;
 
     let mut lints: Vec<VerifyLint> = Vec::new();
     for (i, func) in program.functions.iter().enumerate() {
@@ -714,6 +768,7 @@ pub fn verify_program_owned(
     cfg: &VerifyConfig,
 ) -> Result<VerifiedProgram, VerifyError> {
     verify_host_sigs(&program)?;
+    verify_function_output_names(&program)?;
 
     let mut verified_functions: Vec<VerifiedFunction> = Vec::with_capacity(program.functions.len());
     for (i, func) in program.functions.iter().enumerate() {
@@ -733,6 +788,7 @@ pub fn verify_program_owned_with_lints(
     cfg: &VerifyConfig,
 ) -> Result<(VerifiedProgram, Vec<VerifyLint>), VerifyError> {
     verify_host_sigs(&program)?;
+    verify_function_output_names(&program)?;
 
     let mut verified_functions: Vec<VerifiedFunction> = Vec::with_capacity(program.functions.len());
     let mut lints: Vec<VerifyLint> = Vec::new();
@@ -755,6 +811,47 @@ pub fn verify_program_owned_with_lints(
 struct VerifiedFunctionContainer {
     verified: VerifiedFunction,
     lints: Vec<VerifyLint>,
+}
+
+fn verify_function_output_names(program: &Program) -> Result<(), VerifyError> {
+    for (i, e) in program.function_output_names.iter().enumerate() {
+        let Some(func) = program.functions.get(e.func as usize) else {
+            return Err(VerifyError::Decode(DecodeError::OutOfBounds));
+        };
+        if e.ret >= func.ret_count {
+            return Err(VerifyError::FunctionOutputNameRetOutOfBounds {
+                func: e.func,
+                ret: e.ret,
+            });
+        }
+        let name_str = program.symbol_str(e.name)?;
+        if name_str.is_empty() {
+            return Err(VerifyError::FunctionOutputNameEmpty {
+                func: e.func,
+                ret: e.ret,
+            });
+        }
+
+        for prev in &program.function_output_names[..i] {
+            if prev.func != e.func {
+                continue;
+            }
+            if prev.ret == e.ret {
+                return Err(VerifyError::FunctionOutputNameDuplicateRetIndex {
+                    func: e.func,
+                    ret: e.ret,
+                });
+            }
+            let prev_name = program.symbol_str(prev.name)?;
+            if prev_name == name_str {
+                return Err(VerifyError::FunctionOutputNameDuplicate {
+                    func: e.func,
+                    name: e.name,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify_host_sigs(program: &Program) -> Result<(), VerifyError> {
@@ -3316,9 +3413,9 @@ fn compute_block_writes(
 mod tests {
     use super::*;
     use crate::asm::Asm;
-    use crate::asm::{FunctionSig, ProgramBuilder};
+    use crate::asm::{BuildError, FunctionSig, ProgramBuilder};
     use crate::opcode::Opcode;
-    use crate::program::{Const, FunctionDef, HostSymbol, StructTypeDef, TypeTableDef};
+    use crate::program::{Const, FunctionDef, HostSymbol, StructTypeDef, TypeTableDef, ValueType};
     use crate::value::FuncId;
     use alloc::vec;
 
@@ -3342,6 +3439,35 @@ mod tests {
             }],
         );
         verify_program(&p, &VerifyConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn verifier_rejects_duplicate_function_output_names() {
+        let mut pb = ProgramBuilder::new();
+
+        let mut a = Asm::new();
+        a.const_i64(1, 1);
+        a.const_i64(2, 2);
+        a.ret(0, &[1, 2]);
+        let f = pb
+            .push_function_checked(
+                a,
+                FunctionSig {
+                    arg_types: vec![],
+                    ret_types: vec![ValueType::I64, ValueType::I64],
+                    reg_count: 3,
+                },
+            )
+            .unwrap();
+
+        pb.set_function_output_name(f, 0, "x").unwrap();
+        pb.set_function_output_name(f, 1, "x").unwrap();
+
+        let err = pb.build_verified().unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::Verify(VerifyError::FunctionOutputNameDuplicate { func: 0, .. })
+        ));
     }
 
     #[test]

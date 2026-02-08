@@ -17,8 +17,9 @@ use crate::format::{write_sleb128_i64, write_uleb128_u64};
 use crate::host::HostSig;
 use crate::opcode::Opcode;
 use crate::program::{
-    Const, ConstId, ElemTypeId, FunctionDef, FunctionNameEntry, HostSigDef, HostSigId, HostSymbol,
-    LabelNameEntry, Program, SpanEntry, StructTypeDef, SymbolId, TypeId, TypeTableDef, ValueType,
+    Const, ConstId, ElemTypeId, FunctionDef, FunctionNameEntry, FunctionOutputNameEntry,
+    HostSigDef, HostSigId, HostSymbol, LabelNameEntry, Program, SpanEntry, StructTypeDef, SymbolId,
+    TypeId, TypeTableDef, ValueType,
 };
 use crate::value::Decimal;
 use crate::value::FuncId;
@@ -112,6 +113,13 @@ pub enum BuildError {
         /// The invalid function id.
         func: u32,
     },
+    /// A return index was out of range for the function signature.
+    BadRetIndex {
+        /// The function id.
+        func: u32,
+        /// The invalid return index.
+        ret: u32,
+    },
     /// A function was declared but never defined.
     MissingFunctionBody {
         /// The function id that is missing a body.
@@ -127,6 +135,9 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadFuncId { func } => write!(f, "invalid function id {func}"),
+            Self::BadRetIndex { func, ret } => {
+                write!(f, "invalid return index {ret} for function {func}")
+            }
             Self::MissingFunctionBody { func } => write!(f, "missing function body for {func}"),
             Self::Verify(e) => write!(f, "verification failed: {e}"),
             Self::UnresolvedLabel => write!(f, "unresolved label"),
@@ -220,6 +231,7 @@ pub struct ProgramBuilder {
     program_name: Option<SymbolId>,
     function_names: Vec<FunctionNameEntry>,
     labels: Vec<LabelNameEntry>,
+    function_output_names: Vec<FunctionOutputNameEntry>,
 }
 
 impl ProgramBuilder {
@@ -261,6 +273,37 @@ impl ProgramBuilder {
         } else {
             self.function_names.push(FunctionNameEntry {
                 func: func.0,
+                name: sym,
+            });
+        }
+        Ok(sym)
+    }
+
+    /// Sets a human-readable output name for `ret` in `func` (stored as a symbol id).
+    pub fn set_function_output_name(
+        &mut self,
+        func: FuncId,
+        ret: u32,
+        name: &str,
+    ) -> Result<SymbolId, BuildError> {
+        let Some(def) = self.functions.get(func.0 as usize) else {
+            return Err(BuildError::BadFuncId { func: func.0 });
+        };
+        if (ret as usize) >= def.ret_types.len() {
+            return Err(BuildError::BadRetIndex { func: func.0, ret });
+        }
+
+        let sym = self.symbol(name);
+        if let Some(entry) = self
+            .function_output_names
+            .iter_mut()
+            .find(|e| e.func == func.0 && e.ret == ret)
+        {
+            entry.name = sym;
+        } else {
+            self.function_output_names.push(FunctionOutputNameEntry {
+                func: func.0,
+                ret,
                 name: sym,
             });
         }
@@ -448,6 +491,7 @@ impl ProgramBuilder {
         p.program_name = self.program_name;
         p.function_names = self.function_names;
         p.labels = self.labels;
+        p.function_output_names = self.function_output_names;
         p
     }
 

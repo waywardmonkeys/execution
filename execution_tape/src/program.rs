@@ -210,6 +210,11 @@ pub struct Program {
     /// Frontends may emit these for debugging, profiling, and diagnostics. These are not required
     /// for execution.
     pub labels: Vec<LabelNameEntry>,
+    /// Optional function output-name entries (per-function return index -> name).
+    ///
+    /// These names are intended for tooling (disassembly, profiling, and incremental graph
+    /// wiring). They are advisory and not required for execution.
+    pub function_output_names: Vec<FunctionOutputNameEntry>,
 }
 
 /// A function-name entry.
@@ -229,6 +234,17 @@ pub struct LabelNameEntry {
     /// Bytecode pc (byte offset within the function).
     pub pc: u32,
     /// Symbol id naming the label.
+    pub name: SymbolId,
+}
+
+/// A function output-name entry (per-function return index -> name).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FunctionOutputNameEntry {
+    /// Function index within the program.
+    pub func: u32,
+    /// Return index within the function signature.
+    pub ret: u32,
+    /// Symbol id naming the output.
     pub name: SymbolId,
 }
 
@@ -607,6 +623,7 @@ impl Program {
             program_name: None,
             function_names: Vec::new(),
             labels: Vec::new(),
+            function_output_names: Vec::new(),
         }
     }
 
@@ -631,6 +648,15 @@ impl Program {
         self.labels
             .iter()
             .find(|e| e.func == func && e.pc == pc)
+            .and_then(|e| self.symbol_str(e.name).ok())
+    }
+
+    /// Returns the function output name for `func` and `ret`, if present.
+    #[must_use]
+    pub fn function_output_name(&self, func: u32, ret: u32) -> Option<&str> {
+        self.function_output_names
+            .iter()
+            .find(|e| e.func == func && e.ret == ret)
             .and_then(|e| self.symbol_str(e.name).ok())
     }
 
@@ -905,6 +931,27 @@ impl Program {
             write_section(&mut w, SectionTag::Names, payload.as_slice());
         }
 
+        if !self.function_output_names.is_empty() {
+            let mut payload = Writer::new();
+
+            let mut entries = self.function_output_names.clone();
+            entries.sort_by(|a, b| {
+                a.func
+                    .cmp(&b.func)
+                    .then_with(|| a.ret.cmp(&b.ret))
+                    .then_with(|| a.name.0.cmp(&b.name.0))
+            });
+
+            payload.write_uleb128_u64(entries.len() as u64);
+            for e in &entries {
+                payload.write_uleb128_u64(u64::from(e.func));
+                payload.write_uleb128_u64(u64::from(e.ret));
+                payload.write_uleb128_u64(u64::from(e.name.0));
+            }
+
+            write_section(&mut w, SectionTag::FunctionOutputNames, payload.as_slice());
+        }
+
         w.into_vec()
     }
 
@@ -940,6 +987,7 @@ enum SectionTag {
     FunctionSigs = 7,
     HostSigs = 8,
     Names = 9,
+    FunctionOutputNames = 10,
 }
 
 impl SectionTag {
@@ -954,6 +1002,7 @@ impl SectionTag {
             7 => Some(Self::FunctionSigs),
             8 => Some(Self::HostSigs),
             9 => Some(Self::Names),
+            10 => Some(Self::FunctionOutputNames),
             _ => None,
         }
     }
@@ -1021,6 +1070,28 @@ fn decode_names(payload: &[u8]) -> Result<NamesDef, DecodeError> {
     })
 }
 
+fn decode_function_output_names(
+    payload: &[u8],
+) -> Result<Vec<FunctionOutputNameEntry>, DecodeError> {
+    let mut r = Reader::new(payload);
+    let n = read_usize(&mut r)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let func = u32::try_from(r.read_uleb128_u64()?).map_err(|_| DecodeError::OutOfBounds)?;
+        let ret = u32::try_from(r.read_uleb128_u64()?).map_err(|_| DecodeError::OutOfBounds)?;
+        let name = u32::try_from(r.read_uleb128_u64()?).map_err(|_| DecodeError::OutOfBounds)?;
+        out.push(FunctionOutputNameEntry {
+            func,
+            ret,
+            name: SymbolId(name),
+        });
+    }
+    if r.offset() != payload.len() {
+        return Err(DecodeError::OutOfBounds);
+    }
+    Ok(out)
+}
+
 fn decode_symbols(payload: &[u8]) -> Result<(Vec<SymbolEntry>, String), DecodeError> {
     let mut r = Reader::new(payload);
     let n = read_usize(&mut r)?;
@@ -1052,6 +1123,7 @@ fn decode_current(bytes: &[u8], mut r: Reader<'_>) -> Result<Program, DecodeErro
     let mut bytecode_blobs: Vec<Vec<u8>> = Vec::new();
     let mut span_tables: Vec<Vec<SpanEntry>> = Vec::new();
     let mut names: NamesDef = NamesDef::default();
+    let mut function_output_names: Vec<FunctionOutputNameEntry> = Vec::new();
 
     let mut saw_symbols = false;
     let mut saw_const_pool = false;
@@ -1062,6 +1134,7 @@ fn decode_current(bytes: &[u8], mut r: Reader<'_>) -> Result<Program, DecodeErro
     let mut saw_bytecode_blobs = false;
     let mut saw_span_tables = false;
     let mut saw_names = false;
+    let mut saw_function_output_names = false;
 
     while r.offset() < bytes.len() {
         let tag = SectionTag::from_u8_opt(r.read_u8()?);
@@ -1131,6 +1204,13 @@ fn decode_current(bytes: &[u8], mut r: Reader<'_>) -> Result<Program, DecodeErro
                 }
                 saw_names = true;
                 names = decode_names(payload)?;
+            }
+            Some(SectionTag::FunctionOutputNames) => {
+                if saw_function_output_names {
+                    return Err(DecodeError::DuplicateSection);
+                }
+                saw_function_output_names = true;
+                function_output_names = decode_function_output_names(payload)?;
             }
             None => {
                 // Forward-compat: skip unknown section tags.
@@ -1298,6 +1378,22 @@ fn decode_current(bytes: &[u8], mut r: Reader<'_>) -> Result<Program, DecodeErro
         }
     }
 
+    for e in &function_output_names {
+        let Some(func) = usize::try_from(e.func).ok().and_then(|i| functions.get(i)) else {
+            return Err(DecodeError::OutOfBounds);
+        };
+        if e.ret >= func.ret_count {
+            return Err(DecodeError::OutOfBounds);
+        }
+        if usize::try_from(e.name.0)
+            .ok()
+            .and_then(|i| symbols.get(i))
+            .is_none()
+        {
+            return Err(DecodeError::OutOfBounds);
+        }
+    }
+
     Ok(Program {
         symbols,
         symbol_data,
@@ -1313,6 +1409,7 @@ fn decode_current(bytes: &[u8], mut r: Reader<'_>) -> Result<Program, DecodeErro
         program_name: names.program_name,
         function_names: names.function_names,
         labels: names.labels,
+        function_output_names,
     })
 }
 
@@ -1744,6 +1841,45 @@ mod tests {
                 },
             ],
         );
+
+        let bytes = p.encode();
+        let back = Program::decode(&bytes).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn program_roundtrips_with_function_output_names() {
+        let mut p = Program::new(
+            vec![
+                HostSymbol {
+                    symbol: "mesh.make_cube".into(),
+                },
+                HostSymbol {
+                    symbol: "price.lookup".into(),
+                },
+                HostSymbol {
+                    symbol: "out".into(),
+                },
+            ],
+            vec![],
+            vec![],
+            TypeTableDef::default(),
+            vec![FunctionDef {
+                arg_types: vec![],
+                ret_types: vec![ValueType::U64],
+                reg_count: 2,
+                bytecode: vec![1, 2, 3],
+                spans: vec![SpanEntry {
+                    pc_delta: 0,
+                    span_id: 123,
+                }],
+            }],
+        );
+        p.function_output_names = vec![FunctionOutputNameEntry {
+            func: 0,
+            ret: 0,
+            name: SymbolId(2),
+        }];
 
         let bytes = p.encode();
         let back = Program::decode(&bytes).unwrap();
