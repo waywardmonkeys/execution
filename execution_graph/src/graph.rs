@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
+use execution_tape::host::AccessSink;
 use execution_tape::host::Host;
 use execution_tape::host::ResourceKeyRef;
 use execution_tape::host::SigHash;
@@ -63,6 +64,11 @@ pub enum GraphError {
         /// Signature hash carried in bytecode/program.
         sig_hash: SigHash,
     },
+    /// Duplicate output name in node definition.
+    DuplicateOutputName {
+        /// The duplicated name.
+        name: Box<str>,
+    },
     /// VM execution trapped.
     Trap,
 }
@@ -102,6 +108,9 @@ impl fmt::Display for GraphError {
                 node.as_u64(),
                 sig_hash.0
             ),
+            Self::DuplicateOutputName { name } => {
+                write!(f, "duplicate output name: {name}")
+            }
             Self::Trap => write!(f, "vm trapped during execution"),
         }
     }
@@ -125,11 +134,36 @@ pub(crate) enum Binding {
     },
 }
 
+/// Callback trait for native (Rust) graph nodes.
+///
+/// Implement this trait to create graph nodes that execute Rust code instead of tape programs.
+/// Native nodes participate in the same dirty-tracking and scheduling infrastructure as tape
+/// nodes.
+pub trait NativeNodeFn: fmt::Debug {
+    /// Executes the native node.
+    ///
+    /// `args` contains the resolved input values in the order declared by `input_names`.
+    /// The returned `Vec<Value>` must have exactly as many elements as the node's declared
+    /// `output_names`.
+    ///
+    /// The optional `access` sink can be used to declare dependency reads/writes for dirty
+    /// tracking (same `AccessSink` used by tape host calls). Simple callbacks can ignore it.
+    fn call(
+        &mut self,
+        args: &[Value],
+        access: Option<&mut dyn AccessSink>,
+    ) -> Result<Vec<Value>, GraphError>;
+}
+
 #[derive(Debug)]
 pub(crate) enum NodeKind {
     Tape {
         program: Arc<VerifiedProgram>,
         entry: FuncId,
+    },
+    Native {
+        callback: Box<dyn NativeNodeFn>,
+        name: Box<str>,
     },
 }
 
@@ -157,7 +191,7 @@ impl Node {
     }
 }
 
-/// Execution graph whose nodes are `execution_tape` entrypoints.
+/// Execution graph whose nodes are `execution_tape` entrypoints or native Rust callbacks.
 ///
 /// This is an early, minimal implementation intended to support incremental scheduling work.
 ///
@@ -269,8 +303,9 @@ impl<H: Host> ExecutionGraph<H> {
 
     /// Enables or disables collection of per-node access logs.
     ///
-    /// When enabled, each node's full [`AccessLog`] (bindings, tape accesses, output writes) is
-    /// stored after execution and can be retrieved with [`ExecutionGraph::node_last_access`].
+    /// When enabled, each node's full [`AccessLog`] (bindings, host/native accesses, output
+    /// writes) is stored after execution and can be retrieved with
+    /// [`ExecutionGraph::node_last_access`].
     /// When disabled (the default), the access log is not built, eliminating significant per-run
     /// allocation overhead.
     pub fn set_collect_access_log(&mut self, collect: bool) {
@@ -322,6 +357,16 @@ impl<H: Host> ExecutionGraph<H> {
             }
         }
 
+        // Guard against duplicate output names from the tape program. Duplicates would alias
+        // dirty keys and corrupt the BTreeMap-based output storage.
+        if cfg!(debug_assertions) {
+            for (i, a) in output_names.iter().enumerate() {
+                for b in &output_names[i + 1..] {
+                    debug_assert!(a != b, "duplicate output name in tape program: {a}");
+                }
+            }
+        }
+
         // Intern output keys once at node creation time.
         let mut output_ids: Vec<DirtyKey> = Vec::with_capacity(output_names.len());
         for out_name in output_names.iter().cloned() {
@@ -352,6 +397,64 @@ impl<H: Host> ExecutionGraph<H> {
 
         self.nodes.push(n);
         node
+    }
+
+    /// Adds a native (Rust callback) node and returns its [`NodeId`].
+    ///
+    /// Unlike tape nodes, output names must be provided explicitly since there is no program to
+    /// derive them from. Returns [`GraphError::DuplicateOutputName`] if `output_names` contains
+    /// duplicates.
+    pub fn add_native_node(
+        &mut self,
+        name: impl Into<Box<str>>,
+        input_names: Vec<Box<str>>,
+        output_names: Vec<Box<str>>,
+        callback: impl NativeNodeFn + 'static,
+    ) -> Result<NodeId, GraphError> {
+        // Reject duplicate output names: they would alias dirty keys and corrupt the
+        // BTreeMap-based output storage.
+        for (i, a) in output_names.iter().enumerate() {
+            for b in &output_names[i + 1..] {
+                if a == b {
+                    return Err(GraphError::DuplicateOutputName { name: a.clone() });
+                }
+            }
+        }
+
+        let node = NodeId::new(u64::try_from(self.nodes.len()).unwrap_or(u64::MAX));
+
+        let mut output_ids: Vec<DirtyKey> = Vec::with_capacity(output_names.len());
+        for out_name in output_names.iter().cloned() {
+            let id = self.dirty.intern(ResourceKey::node_output(node, out_name));
+            self.dirty.mark_dirty(id);
+            output_ids.push(id);
+        }
+
+        let mut input_slots: BTreeMap<Box<str>, Vec<usize>> = BTreeMap::new();
+        for (slot, slot_name) in input_names.iter().enumerate() {
+            input_slots.entry(slot_name.clone()).or_default().push(slot);
+        }
+        let input_count = input_names.len();
+
+        let n = Node {
+            kind: NodeKind::Native {
+                callback: Box::new(callback),
+                name: name.into(),
+            },
+            input_names,
+            input_slots,
+            inputs: alloc::vec![None; input_count],
+            output_names,
+            output_ids,
+            outputs: BTreeMap::new(),
+            last_access: None,
+            last_read_ids: Vec::new(),
+            deps_initialized: false,
+            run_count: 0,
+        };
+
+        self.nodes.push(n);
+        Ok(node)
     }
 
     /// Binds a named input to a concrete value.
@@ -845,6 +948,7 @@ impl<H: Host> ExecutionGraph<H> {
                     Some(tape_access),
                 )
                 .map_err(|_| GraphError::Trap),
+            NodeKind::Native { callback, .. } => callback.call(args, Some(tape_access)),
         }
     }
 
@@ -905,12 +1009,15 @@ impl<H: Host> ExecutionGraph<H> {
             }
         }
 
-        // Execute, capturing host accesses.
+        // Execute, capturing accesses.
         let access_count: Cell<usize> = Cell::new(0);
         let mut tape_access = CountingAccessSink::new(&access_count);
+
+        // Strict-deps tracing and TraceSink are tape-specific; skip for native nodes.
+        let is_tape = matches!(self.nodes[node_index].kind, NodeKind::Tape { .. });
         let mut strict = StrictDepsTrace::new(&access_count);
 
-        let (trace_mask, trace) = if self.strict_deps {
+        let (trace_mask, trace) = if self.strict_deps && is_tape {
             (TraceMask::HOST, Some(&mut strict as &mut dyn TraceSink))
         } else {
             (TraceMask::NONE, None)
@@ -930,6 +1037,7 @@ impl<H: Host> ExecutionGraph<H> {
         self.scratch.args = args;
 
         if self.strict_deps
+            && is_tape
             && let Some(v) = strict.violation()
         {
             return Err(GraphError::StrictDepsViolation {
@@ -939,7 +1047,7 @@ impl<H: Host> ExecutionGraph<H> {
             });
         }
 
-        // Merge tape-recorded accesses (host state, opaque ops, etc).
+        // Merge accesses recorded during execution (host state, opaque ops, etc).
         for a in tape_access.log().iter() {
             if let Access::Read(k) = a {
                 self.scratch.read_ids.push(self.dirty.intern(k.clone()));
@@ -2032,5 +2140,255 @@ mod tests {
             Some(&Value::I64(30))
         );
         assert_eq!(g.node_run_count(n), Some(3));
+    }
+
+    // --- Native node tests ---
+
+    #[derive(Debug)]
+    struct SumCallback;
+
+    impl NativeNodeFn for SumCallback {
+        fn call(
+            &mut self,
+            args: &[Value],
+            _access: Option<&mut dyn AccessSink>,
+        ) -> Result<Vec<Value>, GraphError> {
+            let mut sum: i64 = 0;
+            for a in args {
+                if let Value::I64(v) = a {
+                    sum += v;
+                }
+            }
+            Ok(vec![Value::I64(sum)])
+        }
+    }
+
+    #[test]
+    fn native_node_returns_outputs() {
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+        let n = g
+            .add_native_node(
+                "sum",
+                vec!["a".into(), "b".into()],
+                vec!["total".into()],
+                SumCallback,
+            )
+            .unwrap();
+        g.set_input_value(n, "a", Value::I64(3));
+        g.set_input_value(n, "b", Value::I64(4));
+        g.run_all().unwrap();
+
+        assert_eq!(
+            g.node_outputs(n).unwrap().get("total"),
+            Some(&Value::I64(7))
+        );
+        assert_eq!(g.node_run_count(n), Some(1));
+    }
+
+    #[test]
+    fn native_node_participates_in_dirty_tracking() {
+        fn make_identity_program_local(output_name: &str) -> (Arc<VerifiedProgram>, FuncId) {
+            let mut pb = ProgramBuilder::new();
+            let mut a = Asm::new();
+            a.ret(0, &[1]);
+            let f = pb
+                .push_function_checked(
+                    a,
+                    FunctionSig {
+                        arg_types: vec![ValueType::I64],
+                        ret_types: vec![ValueType::I64],
+                        reg_count: 2,
+                    },
+                )
+                .unwrap();
+            pb.set_function_output_name(f, 0, output_name).unwrap();
+            (Arc::new(pb.build_verified().unwrap()), f)
+        }
+
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+
+        // Tape node A (identity) -> Native node B (sum with itself = double)
+        let (a_prog, a_entry) = make_identity_program_local("value");
+        let na = g.add_node(a_prog, a_entry, vec!["in".into()]);
+        let nb = g
+            .add_native_node(
+                "double",
+                vec!["x".into(), "x".into()],
+                vec!["out".into()],
+                SumCallback,
+            )
+            .unwrap();
+
+        g.set_input_value(na, "in", Value::I64(5));
+        g.connect(na, "value", nb, "x");
+
+        g.run_all().unwrap();
+        assert_eq!(
+            g.node_outputs(nb).unwrap().get("out"),
+            Some(&Value::I64(10))
+        );
+        assert_eq!(g.node_run_count(na), Some(1));
+        assert_eq!(g.node_run_count(nb), Some(1));
+
+        // No invalidation → no rerun.
+        g.run_all().unwrap();
+        assert_eq!(g.node_run_count(na), Some(1));
+        assert_eq!(g.node_run_count(nb), Some(1));
+
+        // Invalidate input → both rerun.
+        g.set_input_value(na, "in", Value::I64(7));
+        g.invalidate_input("in");
+        g.run_all().unwrap();
+        assert_eq!(
+            g.node_outputs(nb).unwrap().get("out"),
+            Some(&Value::I64(14))
+        );
+        assert_eq!(g.node_run_count(na), Some(2));
+        assert_eq!(g.node_run_count(nb), Some(2));
+    }
+
+    #[test]
+    fn native_node_upstream_of_tape_node() {
+        fn make_identity_program_local(output_name: &str) -> (Arc<VerifiedProgram>, FuncId) {
+            let mut pb = ProgramBuilder::new();
+            let mut a = Asm::new();
+            a.ret(0, &[1]);
+            let f = pb
+                .push_function_checked(
+                    a,
+                    FunctionSig {
+                        arg_types: vec![ValueType::I64],
+                        ret_types: vec![ValueType::I64],
+                        reg_count: 2,
+                    },
+                )
+                .unwrap();
+            pb.set_function_output_name(f, 0, output_name).unwrap();
+            (Arc::new(pb.build_verified().unwrap()), f)
+        }
+
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+
+        // Native node A (sum) -> Tape node B (identity)
+        let na = g
+            .add_native_node(
+                "sum",
+                vec!["a".into(), "b".into()],
+                vec!["total".into()],
+                SumCallback,
+            )
+            .unwrap();
+        let (b_prog, b_entry) = make_identity_program_local("value");
+        let nb = g.add_node(b_prog, b_entry, vec!["x".into()]);
+
+        g.set_input_value(na, "a", Value::I64(10));
+        g.set_input_value(na, "b", Value::I64(20));
+        g.connect(na, "total", nb, "x");
+
+        g.run_all().unwrap();
+        assert_eq!(
+            g.node_outputs(nb).unwrap().get("value"),
+            Some(&Value::I64(30))
+        );
+    }
+
+    #[test]
+    fn native_node_bad_output_arity() {
+        #[derive(Debug)]
+        struct TwoOutputs;
+
+        impl NativeNodeFn for TwoOutputs {
+            fn call(
+                &mut self,
+                _args: &[Value],
+                _access: Option<&mut dyn AccessSink>,
+            ) -> Result<Vec<Value>, GraphError> {
+                Ok(vec![Value::I64(1), Value::I64(2)])
+            }
+        }
+
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+        let n = g
+            .add_native_node(
+                "bad",
+                vec![],
+                vec!["only_one".into()], // declared 1, callback returns 2
+                TwoOutputs,
+            )
+            .unwrap();
+
+        assert_eq!(g.run_all(), Err(GraphError::BadOutputArity { node: n }));
+    }
+
+    #[test]
+    fn native_node_stateful_callback() {
+        #[derive(Debug)]
+        struct Counter {
+            count: i64,
+        }
+
+        impl NativeNodeFn for Counter {
+            fn call(
+                &mut self,
+                _args: &[Value],
+                _access: Option<&mut dyn AccessSink>,
+            ) -> Result<Vec<Value>, GraphError> {
+                self.count += 1;
+                Ok(vec![Value::I64(self.count)])
+            }
+        }
+
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+        let n = g
+            .add_native_node(
+                "counter",
+                vec!["trigger".into()],
+                vec!["count".into()],
+                Counter { count: 0 },
+            )
+            .unwrap();
+        g.set_input_value(n, "trigger", Value::I64(0));
+
+        g.run_all().unwrap();
+        assert_eq!(
+            g.node_outputs(n).unwrap().get("count"),
+            Some(&Value::I64(1))
+        );
+
+        g.set_input_value(n, "trigger", Value::I64(1));
+        g.invalidate_input("trigger");
+        g.run_all().unwrap();
+        assert_eq!(
+            g.node_outputs(n).unwrap().get("count"),
+            Some(&Value::I64(2))
+        );
+    }
+
+    #[test]
+    fn native_node_in_dot_output() {
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+        let n = g
+            .add_native_node("my_native", vec!["x".into()], vec!["y".into()], SumCallback)
+            .unwrap();
+        g.set_input_value(n, "x", Value::I64(1));
+
+        let dot = g.to_dot();
+        assert!(dot.contains("node#0 (my_native)"), "dot={dot}");
+        assert!(dot.contains("[native]"), "dot={dot}");
+    }
+
+    #[test]
+    fn native_node_duplicate_output_names_rejected() {
+        let mut g = ExecutionGraph::new(HostNoop, Limits::default());
+        let result = g.add_native_node(
+            "bad",
+            vec![],
+            vec!["x".into(), "y".into(), "x".into()],
+            SumCallback,
+        );
+        assert_eq!(
+            result,
+            Err(GraphError::DuplicateOutputName { name: "x".into() })
+        );
     }
 }

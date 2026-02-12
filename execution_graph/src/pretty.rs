@@ -102,6 +102,9 @@ impl<H: Host> ExecutionGraph<H> {
                     };
                     (nl, el)
                 }
+                NodeKind::Native { name, .. } => {
+                    (format!("node#{node_id} ({name})"), String::from("[native]"))
+                }
             };
             let center = escape_record(&format!("{node_line}\n{entry_line}"));
 
